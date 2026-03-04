@@ -1,5 +1,19 @@
 # CONTEXT_SUMMARY.md — Star Stencil + Tau Pyramid Project (Updated)
 
+## System Thesis (target endgame): Route-First Text AI
+We aim to maximize novelty leverage by treating language as a *navigation + local computation* problem.
+
+- **Tau Pyramid = memory + address space:** a ternary hierarchical routing substrate that maps context → top-K neighborhood IDs cheaply (CPU/integer-only).
+- **Local model = tiny compute:** a compact predictor (Star Stencil head or small param model) that runs only on the routed neighborhood (shortlist), not over full vocab/corpus.
+- **Training decomposes into two coupled parts:**
+  1) **Routing training:** improve robustness under partial/noisy queries; reduce required trees/probes/beam for a target recall.
+  2) **Local prediction training:** given (context, retrieved neighborhood IDs/chunks), predict next token with a shortlist objective (hard negatives from near-miss neighborhoods).
+- **Inference loop:** prompt → route (top-K) → local score → sample/generate → update query key/path → repeat.
+- **Novelty leverage:** replace global dense attention with cheap hierarchical routing + tiny local compute; “pyramid path tokens” are a candidate alternative tokenization/latent state.
+
+### Next decisive milestone
+End-to-end demo: use Tau Pyramid to retrieve neighborhoods for each training step, train a tiny local predictor to beat n-gram baselines at similar CPU budget, and show quality/latency gains versus a small transformer at equal compute.
+
 ## Goal
 Build a cost-effective, CPU-friendly alternative AI stack using:
 - deterministic bitwise “context blender” + learned stencils (Star Stencil AI),
