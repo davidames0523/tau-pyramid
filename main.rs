@@ -33,6 +33,11 @@ const LANES: usize = 4; // 4×64 bits per phase => 256 bits/phase => 768 total b
 const FEAT_DIM: usize = 512; // power of two
 const FEATS_PER_QUERY: usize = 96;
 const ROUTER_MARGIN: i32 = 8;
+const DCOMP: usize = PHASES * LANES; // components per key
+const METRIC_MARGIN: i32 = 8;
+const W_MIN: i16 = -32;
+const W_MAX: i16 =  32;
+const SHIFT: i32 = 6;
 
 // Noise test (generalization proxy): flip a small number of bits deterministically
 const NOISE_MASK_BITS: u32 = 2; // higher = fewer flips. 2 => ~1/4 bits flipped in mask before AND density, but we sparsify.
@@ -159,6 +164,28 @@ fn ham(a: u64, b: u64) -> u32 {
 #[derive(Clone, Copy)]
 struct MultiKey {
     h: [[u64; LANES]; PHASES],
+}
+
+#[inline(always)]
+fn comp_dists(query: &MultiKey, piv: &MultiKey) -> [i16; DCOMP] {
+    let mut out = [0i16; DCOMP];
+    let mut t = 0usize;
+    for p in 0..PHASES {
+        for l in 0..LANES {
+            out[t] = ham(query.h[p][l], piv.h[p][l]) as i16;
+            t += 1;
+        }
+    }
+    out
+}
+
+#[inline(always)]
+fn dot_i16(w: &[i16; DCOMP], x: &[i16; DCOMP]) -> i32 {
+    let mut s = 0i32;
+    for i in 0..DCOMP {
+        s += (w[i] as i32) * (x[i] as i32);
+    }
+    s
 }
 
 #[inline(always)]
@@ -484,6 +511,41 @@ impl RouterModel {
     }
 }
 
+// -------------------- per depth learned metric router ------------------------------
+#[derive(Clone)]
+struct MetricRouter {
+    // one weight vector per depth (small and stable)
+    w: Vec<[i16; DCOMP]>,
+}
+
+impl MetricRouter {
+    fn new(depths: usize) -> Self {
+        let mut w = Vec::with_capacity(depths);
+        for _ in 0..depths {
+            w.push([0i16; DCOMP]); // start at zero
+        }
+        Self { w }
+    }
+
+    #[inline(always)]
+    fn cost(&self, depth: usize, d: &[i16; DCOMP]) -> i32 {
+        let di = depth.min(self.w.len().saturating_sub(1));
+        dot_i16(&self.w[di], d)
+    }
+
+    #[inline(always)]
+    fn update(&mut self, depth: usize, d_true: &[i16; DCOMP], d_rival: &[i16; DCOMP]) {
+        let di = depth.min(self.w.len().saturating_sub(1));
+        let w = &mut self.w[di];
+        for i in 0..DCOMP {
+            // w += (d_rival - d_true)
+            let delta: i32 = (d_rival[i] as i32) - (d_true[i] as i32);
+            let nw: i32 = (w[i] as i32 + delta).clamp(W_MIN as i32, W_MAX as i32);
+            w[i] = nw as i16;
+        }
+    }
+}
+
 // -------------------- diverse beam routing (baseline + learned) --------------------
 
 #[derive(Clone, Copy)]
@@ -576,6 +638,83 @@ fn route_beam_baseline(
     cur.into_iter().map(|x| x.node).collect()
 }
 
+fn route_beam_metric_learned(
+    nodes: &[Node],
+    keys: &[MultiKey],
+    root: usize,
+    query: &MultiKey,
+    metric: &MetricRouter,
+    beam: usize,
+    max_depth: usize,
+    learn_levels: usize,
+) -> Vec<usize> {
+    const SHIFT: i32 = 4; // 4=>/16, 5=>/32 (weaker)
+    let step_penalty: i32 = 2;
+
+    let mut cur: Vec<BeamItemU32> = vec![BeamItemU32 { node: root, cost: 0 }];
+
+    for depth in 0..max_depth {
+        if cur.iter().all(|it| is_leaf(&nodes[it.node])) {
+            break;
+        }
+
+        let use_learned = depth < learn_levels;
+
+        let mut next: Vec<BeamItemU32> = Vec::with_capacity(cur.len() * 3);
+        for it in &cur {
+            let n = &nodes[it.node];
+            if is_leaf(n) {
+                next.push(*it);
+                continue;
+            }
+
+            if use_learned {
+                // compute learned costs once
+                let mut lcost = [0i32; 3];
+                for ci in 0..3 {
+                    let piv_id = n.piv[ci];
+                    let dvec = comp_dists(query, &keys[piv_id]);
+                    lcost[ci] = metric.cost(depth, &dvec);
+                }
+                let min_l = lcost[0].min(lcost[1]).min(lcost[2]);
+
+                // push children once
+                for ci in 0..3 {
+                    if let Some(ch) = n.child[ci] {
+                        let piv_id = n.piv[ci];
+                        let base = dist_key(query, &keys[piv_id]) as i32;
+
+                        // one-sided penalty (never decreases cost)
+                        let penalty = ((lcost[ci] - min_l).max(0)) >> SHIFT;
+
+                        let d = base + penalty;
+                        next.push(BeamItemU32 {
+                            node: ch,
+                            cost: it.cost + d + step_penalty,
+                        });
+                    }
+                }
+            } else {
+                // baseline push (once)
+                for ci in 0..3 {
+                    if let Some(ch) = n.child[ci] {
+                        let piv_id = n.piv[ci];
+                        let base = dist_key(query, &keys[piv_id]) as i32;
+                        next.push(BeamItemU32 {
+                            node: ch,
+                            cost: it.cost + base + step_penalty,
+                        });
+                    }
+                }
+            }
+        }
+
+        cur = select_diverse(nodes, next, beam);
+    }
+
+    cur.into_iter().map(|x| x.node).collect()
+}
+
 // Learned routing: cost -= router_score(child) (higher score -> lower cost)
 fn route_beam_learned(
     nodes: &[Node],
@@ -636,15 +775,6 @@ fn route_beam_learned(
     }
 
     cur.into_iter().map(|x| x.node).collect()
-}
-
-// -------------------- streaming build: boundary keys --------------------
-#[inline(always)]
-fn pos_salt(slot: u32, phase: u8, lane: usize) -> u64 {
-    splitmix64((slot as u64)
-        ^ ((phase as u64) << 32)
-        ^ ((lane as u64) << 48)
-        ^ 0x9E37_79B9_7F4A_7C15u64)
 }
 
 fn build_boundary_keys_and_examples(
@@ -776,10 +906,10 @@ struct Tree {
     ids: Vec<usize>,      // permutation of key IDs (positions)
     pos_of: Vec<usize>,   // inverse map: key ID -> position in ids
     root: usize,
-    router: RouterModel,
+    metric: MetricRouter,
 }
 
-fn build_one_tree(keys: &[MultiKey], leaf_size: usize, seed: u64) -> Tree {
+fn build_one_tree(keys: &[MultiKey], leaf_size: usize, seed: u64, train_depth: usize) -> Tree {
     let n = keys.len();
     let mut ids: Vec<usize> = (0..n).collect();
     let mut scratch: Vec<usize> = vec![0usize; n];
@@ -793,15 +923,15 @@ fn build_one_tree(keys: &[MultiKey], leaf_size: usize, seed: u64) -> Tree {
         pos_of[cid] = pos;
     }
 
-    let router = RouterModel::new(nodes.len());
-    Tree { nodes, ids, pos_of, root, router }
+    let metric = MetricRouter::new(train_depth);
+    Tree { nodes, ids, pos_of, root, metric }
 }
 
-fn build_forest(keys: &[MultiKey], leaf_size: usize, trees: usize, seed: u64) -> Vec<Tree> {
+fn build_forest(keys: &[MultiKey], leaf_size: usize, trees: usize, seed: u64, train_depth: usize) -> Vec<Tree> {
     let mut forest: Vec<Tree> = Vec::with_capacity(trees);
     for t in 0..trees {
         let s = seed ^ ((t as u64).wrapping_mul(0x9E3779B97F4A7C15)) ^ 0xC0FFEEu64;
-        forest.push(build_one_tree(keys, leaf_size, s));
+        forest.push(build_one_tree(keys, leaf_size, s, train_depth));
     }
     forest
 }
@@ -823,65 +953,77 @@ fn child_label_for_pos(nodes: &[Node], node_id: usize, pos: usize) -> Option<usi
     None
 }
 
-fn train_tree_router(
+fn train_tree_router_metric(
     tree: &mut Tree,
     keys: &[MultiKey],
     train_ids: &[usize],
     train_depth: usize,
     epochs: usize,
-    seed: u64,
 ) {
-    let mut feat_idx = [0u8; FEATS_PER_QUERY];
-    let mut feat_sgn = [0i8; FEATS_PER_QUERY];
-
-    let mut updates: u64 = 0;
-    let mut correct: u64 = 0;
     let mut total: u64 = 0;
+    let mut correct: u64 = 0;
+    let mut updates: u64 = 0;
+
+    // Any constant seed is fine; per-epoch/per-id mixing makes it deterministic but varied
+    let base_seed: u64 = 0x1F2A_BADC_0DEu64;
 
     for ep in 0..epochs {
         for &cid in train_ids {
             let pos = tree.pos_of[cid];
             let q0 = keys[cid];
 
-            // Rotate sometimes (forces phase-invariance)
-            let rot = (cid as usize + ep) % PHASES;
-            let q_rot = rotate_phases(&q0, rot);
+            // --- v7: train on the same corruption family we evaluate on ---
+            // Clean
+            let q_clean = q0;
 
-            // Structured masking (simulates shorter / partial queries)
-            let mode = ((cid as u8) + (ep as u8)) % 3; // cycles 0/1/2
-            let q_mask = masked_key(&q0, seed ^ 0xD00D ^ (cid as u64) ^ ((ep as u64) << 32), mode);
+            // Noise (matches your noisy proxy distribution)
+            let q_noisy = noisy_key(
+                &q0,
+                base_seed ^ (cid as u64) ^ ((ep as u64) << 32) ^ 0xC0FFEE,
+                NOISE_MASK_BITS,
+            );
 
-            // Noise at two strengths (teach stability)
-            let strength = if (cid & 1) == 0 { NOISE_MASK_BITS } else { NOISE_MASK_BITS + 1 };
-            let q_noise = noisy_key(&q0, seed ^ 0xC0FFEE ^ (cid as u64) ^ ((ep as u64) << 32), strength);
+            // Structured masking / "less evidence" (simulates shorter / partial queries)
+            // mode 1 => ~50% keep; mode 2 => ~25% keep if you want it harsher
+            let q_mask = masked_key(
+                &q0,
+                base_seed ^ (cid as u64) ^ ((ep as u64) << 32) ^ 0xD00D,
+                1,
+            );
 
-            // Keep one clean pass so it doesn't drift
-            let variants = [q0, q_rot, q_mask, q_noise];
+            let variants = [q_clean, q_noisy, q_mask];
 
-            for (vi, q) in variants.iter().enumerate() {
-                let salt = seed
-                    ^ ((ep as u64).wrapping_mul(0x1234_5678))
-                    ^ ((vi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                    ^ (cid as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-
-                RouterModel::extract_features(q, salt, &mut feat_idx, &mut feat_sgn);
-
+            for q in &variants {
                 let mut node = tree.root;
-                for _d in 0..train_depth {
+
+                for depth in 0..train_depth {
                     let lbl = match child_label_for_pos(&tree.nodes, node, pos) {
                         Some(x) => x,
                         None => break,
                     };
 
-                    let scores = tree.router.scores(node, &feat_idx, &feat_sgn);
-                    let mut best = 0usize;
-                    if scores[1] > scores[best] { best = 1; }
-                    if scores[2] > scores[best] { best = 2; }
+                    let n = &tree.nodes[node];
+                    if is_leaf(n) { break; }
 
-                    // second best
+                    // compute per-child component distance vectors (to that child's pivot)
+                    let mut dvec = [[0i16; DCOMP]; 3];
+                    let mut cost = [0i32; 3];
+
+                    for ci in 0..3 {
+                        let piv_id = n.piv[ci];
+                        dvec[ci] = comp_dists(q, &keys[piv_id]);
+                        cost[ci] = tree.metric.cost(depth, &dvec[ci]);
+                    }
+
+                    // predict = argmin cost
+                    let mut best = 0usize;
+                    if cost[1] < cost[best] { best = 1; }
+                    if cost[2] < cost[best] { best = 2; }
+
+                    // second best (for margin/rival)
                     let mut second = if best == 0 { 1 } else { 0 };
                     for c in 0..3 {
-                        if c != best && scores[c] > scores[second] {
+                        if c != best && cost[c] < cost[second] {
                             second = c;
                         }
                     }
@@ -889,14 +1031,15 @@ fn train_tree_router(
                     total += 1;
                     if best == lbl { correct += 1; }
 
+                    // hinge: want cost(lbl) + margin <= cost(rival)
                     let rival = if best == lbl { second } else { best };
-                    if scores[lbl] < scores[rival] + ROUTER_MARGIN {
-                        tree.router.update(node, lbl, rival, &feat_idx, &feat_sgn);
+                    if cost[lbl] + METRIC_MARGIN > cost[rival] {
+                        tree.metric.update(depth, &dvec[lbl], &dvec[rival]);
                         updates += 1;
                     }
 
                     // teacher-forced descend
-                    if let Some(ch) = tree.nodes[node].child[lbl] {
+                    if let Some(ch) = n.child[lbl] {
                         node = ch;
                     } else {
                         break;
@@ -909,7 +1052,7 @@ fn train_tree_router(
     let acc = (correct as f64) / (total as f64).max(1.0);
     let upd = (updates as f64) / (total as f64).max(1.0);
     println!(
-        "  router train: steps={} acc={:.2}% updates/step={:.2}%",
+        "  metric router train: steps={} acc={:.2}% updates/step={:.2}%",
         total, 100.0 * acc, 100.0 * upd
     );
 }
@@ -963,9 +1106,13 @@ fn recall_forest(
                         }
 
                         for tr in forest_ref {
+                            let learn_levels = 4; // start here
+
                             let beam_nodes = if learned {
-                                let learn_levels = 8;
-                                route_beam_learned(&tr.nodes, &tr.ids, keys_ref, tr.root, &tr.router, &q, &feat_idx, &feat_sgn, beam, 64, learn_levels)
+                                route_beam_metric_learned(
+                                    &tr.nodes, keys_ref, tr.root, &q, &tr.metric,
+                                    beam, 64, learn_levels
+                                )
                             } else {
                                 route_beam_baseline(&tr.nodes, &tr.ids, keys_ref, tr.root, &q, beam, 64)
                             };
@@ -1071,7 +1218,7 @@ fn main() {
 
     // 2) Build forest
     let t1 = Instant::now();
-    let mut forest = build_forest(&keys, leaf_size, trees, seed);
+    let mut forest = build_forest(&keys, leaf_size, trees, seed, train_depth);
     let dt_forest = t1.elapsed();
     let node_sum: usize = forest.iter().map(|t| t.nodes.len()).sum();
     println!("Forest built:");
@@ -1094,7 +1241,7 @@ fn main() {
             let seed_t = seed ^ (ti as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0x51515151;
             scope.spawn(move || {
                 println!(" Tree {}:", ti);
-                train_tree_router(tr, keys_ref, train_ids, train_depth, epochs, seed_t);
+                train_tree_router_metric(tr, keys_ref, train_ids, train_depth, epochs);
             });
         }
     });
